@@ -467,6 +467,69 @@ var _ = framework.KubeDescribe("Services", func() {
 		}
 	})
 
+	// Test a service with loadbalancer having a static IP address reserved with the loadbalancer name
+	// Because the GCE cloud provider reserves addresses while making changes to LBs, it's possible
+	// that the controller orphans the address due to controller failure or restart. Therefore, this test
+	// ensures that the service controller/cloud provider continues to operate normally.
+	It("should be able to attach static IP to LoadBalancer service [Slow]", func(){
+		// requires cloud load-balancer support
+		framework.SkipUnlessProviderIs("gce", "gke")
+
+		ns := f.Namespace.Name
+		svc := "static-ip-test"
+		framework.Logf("namespace for LB test: %s, service: %v", ns, svc)
+
+		jig := framework.NewServiceTestJig(cs, svc)
+		loadBalancerLagTimeout := framework.LoadBalancerLagTimeoutDefault
+
+		loadBalancerCreateTimeout := framework.LoadBalancerCreateTimeoutDefault
+		if nodes := framework.GetReadySchedulableNodesOrDie(cs); len(nodes.Items) > framework.LargeClusterMinNodesNumber {
+			loadBalancerCreateTimeout = framework.LoadBalancerCreateTimeoutLarge
+		}
+
+		By("creating a UDP service " + svc + " with type=LoadBalancer in namespace " + ns)
+		lbService := jig.CreateUDPServiceOrFail(ns, nil)
+		jig.SanityCheckService(lbService, v1.ServiceTypeLoadBalancer)
+
+		By("creating a pod to be part of the LB service " + svc)
+		jig.RunOrFail(ns, nil)
+
+		By("waiting for the TCP service to have a load balancer")
+		// Wait for the load balancer to be created asynchronously
+		lbService = jig.WaitForLoadBalancerOrFail(ns, lbService.Name, loadBalancerCreateTimeout)
+		jig.SanityCheckService(lbService, v1.ServiceTypeLoadBalancer)
+		ingressIP := framework.GetIngressPoint(&lbService.Status.LoadBalancer.Ingress[0])
+		framework.Logf("load balancer: %s", ingressIP)
+
+
+		By("hitting the UDP service's LoadBalancer")
+		svcPort := int(lbService.Spec.Ports[0].Port)
+		jig.TestReachableUDP(ingressIP, svcPort, loadBalancerLagTimeout)
+
+		staticIPName := cloudprovider.GetLoadBalancerName(lbService)
+		By("creating a static load balancer IP with name " + staticIPName + " and existing service's address " + ingressIP)
+		addr, err := framework.CreateGCEStaticIP(staticIPName, ingressIP)
+		defer func() {
+			// Release GCE static IP - this is not kube-managed and will not be automatically released.
+			if err := framework.DeleteGCEStaticIP(staticIPName); err != nil {
+				framework.Logf("failed to release static IP %s: %v", staticIPName, err)
+			}
+		}()
+		Expect(err).NotTo(HaveOccurred())
+		framework.Logf("Allocated static load balancer IP: %s", addr)
+
+		lbService = jig.UpdateServiceOrFail(ns, lbService.Name, func(s *v1.Service) {
+			s.Spec.Ports = []v1.ServicePort{
+				{Port: 80, Name: "http", Protocol: "TCP"},
+			}
+		})
+		jig.SanityCheckService(lbService, v1.ServiceTypeLoadBalancer)
+		svcPort = int(lbService.Spec.Ports[0].Port)
+
+		By("hitting the LB service's port which should be TCP")
+		jig.TestReachableHTTP(ingressIP, svcPort, loadBalancerLagTimeout)
+	})
+
 	It("should be able to change the type and ports of a service [Slow]", func() {
 		// requires cloud load-balancer support
 		framework.SkipUnlessProviderIs("gce", "gke", "aws")
@@ -555,7 +618,7 @@ var _ = framework.KubeDescribe("Services", func() {
 		if framework.ProviderIs("gce", "gke") {
 			By("creating a static load balancer IP")
 			staticIPName = fmt.Sprintf("e2e-external-lb-test-%s", framework.RunId)
-			requestedIP, err = framework.CreateGCEStaticIP(staticIPName)
+			requestedIP, err = framework.CreateGCEStaticIP(staticIPName, "")
 			defer func() {
 				if staticIPName != "" {
 					// Release GCE static IP - this is not kube-managed and will not be automatically released.

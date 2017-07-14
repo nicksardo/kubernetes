@@ -34,7 +34,8 @@ import (
 // TODO: These should really just use the GCE API client library or at least use
 // better formatted output from the --format flag.
 
-func CreateGCEStaticIP(name string) (string, error) {
+// CreateGCEStaticIP executes gcloud command to create a static, regional address
+func CreateGCEStaticIP(name, address string) (string, error) {
 	// gcloud compute --project "abshah-kubernetes-001" addresses create "test-static-ip" --region "us-central1"
 	// abshah@abhidesk:~/go/src/code.google.com/p/google-api-go-client/compute/v1$ gcloud compute --project "abshah-kubernetes-001" addresses create "test-static-ip" --region "us-central1"
 	// Created [https://www.googleapis.com/compute/v1/projects/abshah-kubernetes-001/regions/us-central1/addresses/test-static-ip].
@@ -47,11 +48,20 @@ func CreateGCEStaticIP(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to convert zone to region: %v", err)
 	}
+
+	cmdArgs := []string{
+		"compute", "addresses", "create",
+		name, "--project", TestContext.CloudConfig.ProjectID,
+		"--region", region, "-q", "--format=yaml",
+	}
+
+	if address != "" {
+		cmdArgs = append(cmdArgs, "--addresses", address)
+	}
+
 	glog.Infof("Creating static IP with name %q in project %q in region %q", name, TestContext.CloudConfig.ProjectID, region)
 	for attempts := 0; attempts < 4; attempts++ {
-		outputBytes, err = exec.Command("gcloud", "compute", "addresses", "create",
-			name, "--project", TestContext.CloudConfig.ProjectID,
-			"--region", region, "-q", "--format=yaml").CombinedOutput()
+		outputBytes, err = exec.Command("gcloud", cmdArgs...).CombinedOutput()
 		if err == nil {
 			break
 		}
