@@ -399,10 +399,6 @@ func CreateControllerContext(s *options.CMServer, rootClientBuilder, clientBuild
 	if err != nil {
 		return ControllerContext{}, fmt.Errorf("cloud provider could not be initialized: %v", err)
 	}
-	if cloud != nil {
-		// Initialize the cloud provider with a reference to the clientBuilder
-		cloud.Initialize(rootClientBuilder)
-	}
 
 	ctx := ControllerContext{
 		ClientBuilder:      clientBuilder,
@@ -420,6 +416,11 @@ func StartControllers(ctx ControllerContext, startSATokenController InitFunc, co
 	// If this fails, just return here and fail since other controllers won't be able to get credentials.
 	if _, err := startSATokenController(ctx); err != nil {
 		return err
+	}
+
+	if ctx.Cloud != nil {
+		// Initialize the cloud provider with a reference to the clientBuilder
+		ctx.Cloud.Initialize(ctx.ClientBuilder)
 	}
 
 	for controllerName, initFn := range controllers {

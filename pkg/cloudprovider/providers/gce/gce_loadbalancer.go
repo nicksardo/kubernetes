@@ -118,6 +118,7 @@ func (gce *GCECloud) EnsureLoadBalancer(clusterName string, svc *v1.Service, nod
 		return nil, err
 	}
 
+	gce.eventRecorder.Event(svc, v1.EventTypeNormal, "WELCOMEWAGON", "Welcome to the jungle")
 	glog.V(4).Infof("EnsureLoadBalancer(%v, %v, %v, %v, %v): ensure %v loadbalancer", clusterName, svc.Namespace, svc.Name, loadBalancerName, gce.region, desiredScheme)
 
 	existingFwdRule, err := gce.GetRegionForwardingRule(loadBalancerName, gce.region)
