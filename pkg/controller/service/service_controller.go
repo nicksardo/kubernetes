@@ -18,6 +18,7 @@ package service
 
 import (
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"time"
@@ -290,7 +291,7 @@ func (s *ServiceController) createLoadBalancerIfNeeded(key string, service *v1.S
 		if exists {
 			glog.Infof("Deleting existing load balancer for service %s that no longer needs a load balancer.", key)
 			s.eventRecorder.Event(service, v1.EventTypeNormal, "DeletingLoadBalancer", "Deleting load balancer")
-			if err := s.balancer.EnsureLoadBalancerDeleted(s.clusterName, service); err != nil {
+			if err := s.ensureLoadBalancerDeleted(s.clusterName, service); err != nil {
 				return err, retryable
 			}
 			s.eventRecorder.Event(service, v1.EventTypeNormal, "DeletedLoadBalancer", "Deleted load balancer")
@@ -357,7 +358,7 @@ func (s *ServiceController) persistUpdate(service *v1.Service) error {
 	return err
 }
 
-func (s *ServiceController) ensureLoadBalancer(service *v1.Service) (*v1.LoadBalancerStatus, error) {
+func (s *ServiceController) ensureLoadBalancer(service *v1.Service) (status *v1.LoadBalancerStatus, err error) {
 	nodes, err := s.nodeLister.ListWithPredicate(getNodeConditionPredicate())
 	if err != nil {
 		return nil, err
@@ -368,10 +369,39 @@ func (s *ServiceController) ensureLoadBalancer(service *v1.Service) (*v1.LoadBal
 		s.eventRecorder.Eventf(service, v1.EventTypeWarning, "UnAvailableLoadBalancer", "There are no available nodes for LoadBalancer service %s/%s", service.Namespace, service.Name)
 	}
 
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered from panic: %v; stack trace: %v", r, string(debug.Stack()))
+		}
+	}()
+
 	// - Only one protocol supported per service
 	// - Not all cloud providers support all protocols and the next step is expected to return
 	//   an error for unsupported protocols
-	return s.balancer.EnsureLoadBalancer(s.clusterName, service, nodes)
+	status, err = s.balancer.EnsureLoadBalancer(s.clusterName, service, nodes)
+	return status, err
+}
+
+func (s *ServiceController) ensureLoadBalancerDeleted(clusterName string, service *v1.Service) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered from panic: %v; stack trace: %v", r, string(debug.Stack()))
+		}
+	}()
+
+	err = s.balancer.EnsureLoadBalancerDeleted(clusterName, service)
+	return err
+}
+
+func (s *ServiceController) updateLoadBalancer(clusterName string, service *v1.Service, nodes []*v1.Node) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("recovered from panic: %v; stack trace: %v", r, string(debug.Stack()))
+		}
+	}()
+
+	err = s.balancer.UpdateLoadBalancer(clusterName, service, nodes)
+	return err
 }
 
 // ListKeys implements the interface required by DeltaFIFO to list the keys we
@@ -691,7 +721,7 @@ func (s *ServiceController) lockedUpdateLoadBalancerHosts(service *v1.Service, h
 	}
 
 	// This operation doesn't normally take very long (and happens pretty often), so we only record the final event
-	err := s.balancer.UpdateLoadBalancer(s.clusterName, service, hosts)
+	err := s.updateLoadBalancer(s.clusterName, service, hosts)
 	if err == nil {
 		// If there are no available nodes for LoadBalancer service, make a EventTypeWarning event for it.
 		if len(hosts) == 0 {
@@ -703,8 +733,8 @@ func (s *ServiceController) lockedUpdateLoadBalancerHosts(service *v1.Service, h
 	}
 
 	// It's only an actual error if the load balancer still exists.
-	if _, exists, err := s.balancer.GetLoadBalancer(s.clusterName, service); err != nil {
-		glog.Errorf("External error while checking if load balancer %q exists: name, %v", cloudprovider.GetLoadBalancerName(service), err)
+	if _, exists, getErr := s.balancer.GetLoadBalancer(s.clusterName, service); getErr != nil {
+		glog.Errorf("External error while checking if load balancer %q exists: name, %v", cloudprovider.GetLoadBalancerName(service), getErr)
 	} else if !exists {
 		return nil
 	}
@@ -804,7 +834,7 @@ func (s *ServiceController) processLoadBalancerDelete(cachedService *cachedServi
 		return nil, doNotRetry
 	}
 	s.eventRecorder.Event(service, v1.EventTypeNormal, "DeletingLoadBalancer", "Deleting load balancer")
-	err := s.balancer.EnsureLoadBalancerDeleted(s.clusterName, service)
+	err := s.ensureLoadBalancerDeleted(s.clusterName, service)
 	if err != nil {
 		message := "Error deleting load balancer (will retry): " + err.Error()
 		s.eventRecorder.Event(service, v1.EventTypeWarning, "DeletingLoadBalancerFailed", message)

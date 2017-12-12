@@ -166,6 +166,10 @@ func (f *FakeCloud) EnsureLoadBalancer(clusterName string, service *v1.Service, 
 	}
 	region := zone.Region
 
+	if service.Annotations["panic"] == "true" {
+		panic("Simulated panic of cloudprovider interface")
+	}
+
 	f.Balancers[name] = FakeBalancer{name, region, spec.LoadBalancerIP, spec.Ports, nodes}
 
 	status := &v1.LoadBalancerStatus{}
@@ -178,6 +182,11 @@ func (f *FakeCloud) EnsureLoadBalancer(clusterName string, service *v1.Service, 
 // It adds an entry "update" into the internal method call record.
 func (f *FakeCloud) UpdateLoadBalancer(clusterName string, service *v1.Service, nodes []*v1.Node) error {
 	f.addCall("update")
+
+	if service.Annotations["panic"] == "true" {
+		panic("Simulated panic of cloudprovider interface")
+	}
+
 	f.UpdateCalls = append(f.UpdateCalls, FakeUpdateBalancerCall{service, nodes})
 	return f.Err
 }

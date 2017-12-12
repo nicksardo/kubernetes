@@ -50,6 +50,7 @@ func alwaysReady() bool { return true }
 
 func newController() (*ServiceController, *fakecloud.FakeCloud, *fake.Clientset) {
 	cloud := &fakecloud.FakeCloud{}
+	cloud.Exists = true
 	cloud.Region = region
 
 	client := fake.NewSimpleClientset()
@@ -125,52 +126,72 @@ func TestCreateExternalLoadBalancer(t *testing.T) {
 			expectErr:           false,
 			expectCreateAttempt: true,
 		},
+		{
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "panic-service",
+					Namespace: "default",
+					SelfLink:  testapi.Default.SelfLink("services", "basic-service1"),
+					Annotations: map[string]string{
+						"panic": "true",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					Ports: []v1.ServicePort{{
+						Port:     80,
+						Protocol: v1.ProtocolTCP,
+					}},
+					Type: v1.ServiceTypeLoadBalancer,
+				},
+			},
+			expectErr:           true,
+			expectCreateAttempt: false,
+		},
 	}
 
 	for _, item := range table {
-		controller, cloud, client := newController()
-		err, _ := controller.createLoadBalancerIfNeeded("foo/bar", item.service)
-		if !item.expectErr && err != nil {
-			t.Errorf("unexpected error: %v", err)
-		} else if item.expectErr && err == nil {
-			t.Errorf("expected error creating %v, got nil", item.service)
-		}
-		actions := client.Actions()
-		if !item.expectCreateAttempt {
-			if len(cloud.Calls) > 0 {
-				t.Errorf("unexpected cloud provider calls: %v", cloud.Calls)
+		t.Run(item.service.Name, func(t *testing.T) {
+			controller, cloud, client := newController()
+			err, _ := controller.createLoadBalancerIfNeeded("foo/bar", item.service)
+			if !item.expectErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			} else if item.expectErr && err == nil {
+				t.Errorf("expected error creating %v, got nil", item.service)
 			}
-			if len(actions) > 0 {
-				t.Errorf("unexpected client actions: %v", actions)
-			}
-		} else {
-			var balancer *fakecloud.FakeBalancer
-			for k := range cloud.Balancers {
+			actions := client.Actions()
+			if !item.expectCreateAttempt {
+				if len(actions) > 0 {
+					t.Errorf("unexpected client actions: %v", actions)
+				}
+			} else {
+				var balancer *fakecloud.FakeBalancer
+				for k := range cloud.Balancers {
+					if balancer == nil {
+						b := cloud.Balancers[k]
+						balancer = &b
+					} else {
+						t.Errorf("expected one load balancer to be created, got %v", cloud.Balancers)
+						break
+					}
+				}
 				if balancer == nil {
-					b := cloud.Balancers[k]
-					balancer = &b
-				} else {
-					t.Errorf("expected one load balancer to be created, got %v", cloud.Balancers)
-					break
+					t.Errorf("expected one load balancer to be created, got none")
+				} else if balancer.Name != controller.loadBalancerName(item.service) ||
+					balancer.Region != region ||
+					balancer.Ports[0].Port != item.service.Spec.Ports[0].Port {
+					t.Errorf("created load balancer has incorrect parameters: %v", balancer)
+				}
+				actionFound := false
+				for _, action := range actions {
+					if action.GetVerb() == "update" && action.GetResource().Resource == "services" {
+						actionFound = true
+					}
+				}
+				if !actionFound {
+					t.Errorf("expected updated service to be sent to client, got these actions instead: %v", actions)
 				}
 			}
-			if balancer == nil {
-				t.Errorf("expected one load balancer to be created, got none")
-			} else if balancer.Name != controller.loadBalancerName(item.service) ||
-				balancer.Region != region ||
-				balancer.Ports[0].Port != item.service.Spec.Ports[0].Port {
-				t.Errorf("created load balancer has incorrect parameters: %v", balancer)
-			}
-			actionFound := false
-			for _, action := range actions {
-				if action.GetVerb() == "update" && action.GetResource().Resource == "services" {
-					actionFound = true
-				}
-			}
-			if !actionFound {
-				t.Errorf("expected updated service to be sent to client, got these actions instead: %v", actions)
-			}
-		}
+		})
 	}
 }
 
@@ -181,16 +202,20 @@ func TestUpdateNodesInExternalLoadBalancer(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "node73"}},
 	}
-	table := []struct {
+	panicService := newService("s99", "321", v1.ServiceTypeLoadBalancer)
+	panicService.Annotations = map[string]string{"panic": "true"}
+
+	table := map[string]struct {
 		services            []*v1.Service
 		expectedUpdateCalls []fakecloud.FakeUpdateBalancerCall
+		expectedRetry       []*v1.Service
 	}{
-		{
+		"No services": {
 			// No services present: no calls should be made.
 			services:            []*v1.Service{},
 			expectedUpdateCalls: nil,
 		},
-		{
+		"No LB services": {
 			// Services do not have external load balancers: no calls should be made.
 			services: []*v1.Service{
 				newService("s0", "111", v1.ServiceTypeClusterIP),
@@ -198,7 +223,7 @@ func TestUpdateNodesInExternalLoadBalancer(t *testing.T) {
 			},
 			expectedUpdateCalls: nil,
 		},
-		{
+		"One LB service": {
 			// Services does have an external load balancer: one call should be made.
 			services: []*v1.Service{
 				newService("s0", "333", v1.ServiceTypeLoadBalancer),
@@ -207,7 +232,7 @@ func TestUpdateNodesInExternalLoadBalancer(t *testing.T) {
 				{Service: newService("s0", "333", v1.ServiceTypeLoadBalancer), Hosts: nodes},
 			},
 		},
-		{
+		"Three LB services": {
 			// Three services have an external load balancer: three calls.
 			services: []*v1.Service{
 				newService("s0", "444", v1.ServiceTypeLoadBalancer),
@@ -220,7 +245,7 @@ func TestUpdateNodesInExternalLoadBalancer(t *testing.T) {
 				{Service: newService("s2", "666", v1.ServiceTypeLoadBalancer), Hosts: nodes},
 			},
 		},
-		{
+		"Two LB services & two non-LB services": {
 			// Two services have an external load balancer and two don't: two calls.
 			services: []*v1.Service{
 				newService("s0", "777", v1.ServiceTypeNodePort),
@@ -233,7 +258,7 @@ func TestUpdateNodesInExternalLoadBalancer(t *testing.T) {
 				{Service: newService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: nodes},
 			},
 		},
-		{
+		"Nil service": {
 			// One service has an external load balancer and one is nil: one call.
 			services: []*v1.Service{
 				newService("s0", "234", v1.ServiceTypeLoadBalancer),
@@ -243,35 +268,47 @@ func TestUpdateNodesInExternalLoadBalancer(t *testing.T) {
 				{Service: newService("s0", "234", v1.ServiceTypeLoadBalancer), Hosts: nodes},
 			},
 		},
+		"Service causing cloudprovider to panic": {
+			// One service has an external load balancer and one is nil: one call.
+			services: []*v1.Service{
+				newService("s0", "234", v1.ServiceTypeLoadBalancer),
+				panicService,
+			},
+			expectedRetry: []*v1.Service{panicService},
+			expectedUpdateCalls: []fakecloud.FakeUpdateBalancerCall{
+				{Service: newService("s0", "234", v1.ServiceTypeLoadBalancer), Hosts: nodes},
+			},
+		},
 	}
-	for _, item := range table {
-		controller, cloud, _ := newController()
+	for name, item := range table {
+		t.Run(name, func(t *testing.T) {
+			controller, cloud, _ := newController()
 
-		var services []*v1.Service
-		for _, service := range item.services {
-			services = append(services, service)
-		}
-		if err := controller.updateLoadBalancerHosts(services, nodes); err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-		if !reflect.DeepEqual(item.expectedUpdateCalls, cloud.UpdateCalls) {
-			t.Errorf("expected update calls mismatch, expected %+v, got %+v", item.expectedUpdateCalls, cloud.UpdateCalls)
-		}
+			var services []*v1.Service
+			for _, service := range item.services {
+				services = append(services, service)
+			}
+			servicesToRetry := controller.updateLoadBalancerHosts(services, nodes)
+			if !reflect.DeepEqual(item.expectedRetry, servicesToRetry) {
+				t.Errorf("expected services retry; got %v, wanted %v", servicesToRetry, item.expectedRetry)
+			}
+			if !reflect.DeepEqual(item.expectedUpdateCalls, cloud.UpdateCalls) {
+				t.Errorf("expected update calls mismatch, expected %+v, got %+v", item.expectedUpdateCalls, cloud.UpdateCalls)
+			}
+		})
 	}
 }
 
 func TestGetNodeConditionPredicate(t *testing.T) {
-	tests := []struct {
+	tests := map[string]struct {
 		node         v1.Node
 		expectAccept bool
-		name         string
 	}{
-		{
+		"empty": {
 			node:         v1.Node{},
 			expectAccept: false,
-			name:         "empty",
 		},
-		{
+		"basic": {
 			node: v1.Node{
 				Status: v1.NodeStatus{
 					Conditions: []v1.NodeCondition{
@@ -280,9 +317,8 @@ func TestGetNodeConditionPredicate(t *testing.T) {
 				},
 			},
 			expectAccept: true,
-			name:         "basic",
 		},
-		{
+		"unschedulable": {
 			node: v1.Node{
 				Spec: v1.NodeSpec{Unschedulable: true},
 				Status: v1.NodeStatus{
@@ -292,22 +328,22 @@ func TestGetNodeConditionPredicate(t *testing.T) {
 				},
 			},
 			expectAccept: false,
-			name:         "unschedulable",
 		},
 	}
 	pred := getNodeConditionPredicate()
-	for _, test := range tests {
-		accept := pred(&test.node)
-		if accept != test.expectAccept {
-			t.Errorf("Test failed for %s, expected %v, saw %v", test.name, test.expectAccept, accept)
-		}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			accept := pred(&test.node)
+			if accept != test.expectAccept {
+				t.Errorf("predicate() got %v, wanted %v", accept, test.expectAccept)
+			}
+		})
 	}
 }
 
 // TODO(a-robinson): Add tests for update/sync/delete.
 
 func TestProcessServiceUpdate(t *testing.T) {
-
 	var controller *ServiceController
 	var cloud *fakecloud.FakeCloud
 
@@ -589,7 +625,6 @@ func TestProcessServiceDeletion(t *testing.T) {
 }
 
 func TestDoesExternalLoadBalancerNeedsUpdate(t *testing.T) {
-
 	var oldSvc, newSvc *v1.Service
 
 	testCases := []struct {
@@ -703,7 +738,6 @@ func TestDoesExternalLoadBalancerNeedsUpdate(t *testing.T) {
 //and tc2 (delCache would remove element from the cache without it adding automatically)
 //Please keep this in mind while adding new test cases.
 func TestServiceCache(t *testing.T) {
-
 	//ServiceCache a common service cache for all the test cases
 	sc := &serviceCache{serviceMap: make(map[string]*cachedService)}
 
