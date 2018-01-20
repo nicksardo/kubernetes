@@ -43,18 +43,24 @@ func (g *Service) wrapOperation(anyOp interface{}) (operation, error) {
 		if err != nil {
 			return nil, err
 		}
+		o.Region = r.Key.Region
+		o.Zone = r.Key.Zone
 		return &gaOperation{g, o, r.ProjectID}, nil
 	case *alpha.Operation:
 		r, err := ParseResourceURL(o.SelfLink)
 		if err != nil {
 			return nil, err
 		}
+		o.Region = r.Key.Region
+		o.Zone = r.Key.Zone
 		return &alphaOperation{g, o, r.ProjectID}, nil
 	case *beta.Operation:
 		r, err := ParseResourceURL(o.SelfLink)
 		if err != nil {
 			return nil, err
 		}
+		o.Region = r.Key.Region
+		o.Zone = r.Key.Zone
 		return &betaOperation{g, o, r.ProjectID}, nil
 	default:
 		return nil, fmt.Errorf("invalid type %T", anyOp)
